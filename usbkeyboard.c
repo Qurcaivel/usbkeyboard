@@ -1,3 +1,5 @@
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+
 #include <linux/kernel.h>
 #include <linux/slab.h>
 #include <linux/module.h>
@@ -13,7 +15,7 @@ MODULE_AUTHOR(DRIVER_AUTHOR);
 MODULE_DESCRIPTION(DRIVER_DESC);
 MODULE_LICENSE("GPL");
 
-static int usbkeyboard_probe(struct usb_interface* iface, const struct usb_device_id* id)
+static int usbkeyboard_probe(struct usb_interface* intf, const struct usb_device_id* id)
 {
     return 0;
 }
