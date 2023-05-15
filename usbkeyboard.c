@@ -40,23 +40,32 @@ static const unsigned char usbkeyboard_keycode[256] = {
 struct usbkeyboard {
     struct input_dev* dev;
     struct usb_device* usbdev;
+
     struct urb* irq;
-    
+    struct urb* led;
+
+    struct usb_ctrlrequest* creq;
+
     char name[KBD_NAME_MAX];
     char phys[KBD_PHYS_MAX];
     
     unsigned char prev_presses[8];
     unsigned char* presses;
 
+    unsigned char curr_leds;
+    unsigned char* leds;    
+
     dma_addr_t presses_dma;
+    dma_addr_t leds_dma;
+
+    bool leds_urb_submitted;
+    spinlock_t leds_lock;
 };
 
 static void usbkeyboard_irq(struct urb* urb)
 {
-    struct usbkeyboard* kbd;
+    struct usbkeyboard* kbd = urb->context;
     int i;
-    
-    kbd = urb->context;
     
     switch(urb->status){
         case 0:
@@ -70,6 +79,8 @@ static void usbkeyboard_irq(struct urb* urb)
         default:
             goto resubmit;
     }
+
+    kbd = urb->context;
 
     for(i = 0; i < 8; i++){
         input_report_key(kbd->dev, usbkeyboard_keycode[i + 224], (kbd->presses[0] >> i) & 1);
@@ -112,6 +123,82 @@ resubmit:
     }
 }
 
+static void usbkeyboard_led(struct urb* urb)
+{
+    unsigned long flags;
+    struct usbkeyboard* kbd;
+
+    if(urb->status){
+        hid_warn(urb->dev, "Received led urb with non-zero status %d\n", urb->status);
+    }
+
+    kbd = urb->context;
+
+    spin_lock_irqsave(&kbd->leds_lock, flags);
+
+    if(*(kbd->leds) == kbd->curr_leds){
+        kbd->leds_urb_submitted = false;
+        spin_unlock_irqrestore(&kbd->leds_lock, flags);
+        return;
+    }
+
+    *(kbd->leds) = kbd->curr_leds;
+
+    kbd->led->dev = kbd->usbdev;
+
+    if(usb_submit_urb(kbd->led, GFP_ATOMIC)){
+        hid_err(urb->dev, "Failed to submit led urb\n");
+        kbd->leds_urb_submitted = false;
+    }
+
+    spin_unlock_irqrestore(&kbd->leds_lock, flags);
+}
+
+static int usbkeyboard_event(struct input_dev* dev, unsigned int type, unsigned int code, int value)
+{
+    unsigned long flags;
+    struct usbkeyboard* kbd;
+
+    if(type != EV_LED){
+        return -1;
+    }
+
+    kbd = input_get_drvdata(dev);
+
+    spin_lock_irqsave(&kbd->leds_lock, flags);
+
+    kbd->curr_leds = (!!test_bit(LED_KANA,    dev->led) << 4) |
+                     (!!test_bit(LED_COMPOSE, dev->led) << 3) |
+                     (!!test_bit(LED_SCROLLL, dev->led) << 2) |
+                     (!!test_bit(LED_CAPSL,   dev->led) << 1) |
+                     (!!test_bit(LED_NUML,    dev->led));
+
+    if(kbd->leds_urb_submitted){
+        spin_unlock_irqrestore(&kbd->leds_lock, flags);
+        return 0;
+    }
+
+    if(*(kbd->leds) == kbd->curr_leds){
+        spin_unlock_irqrestore(&kbd->leds_lock, flags);
+        return 0;
+    }
+
+    *(kbd->leds) = kbd->curr_leds;
+
+    kbd->led->dev = kbd->usbdev;
+
+    if(usb_submit_urb(kbd->led, GFP_ATOMIC)){
+        pr_err("Failed to submit led urb\n");
+    }
+    else {
+        kbd->leds_urb_submitted = true;
+    }
+
+    spin_unlock_irqrestore(&kbd->leds_lock, flags);
+
+    return 0;
+}
+
 static int usbkeyboard_open(struct input_dev* dev)
 {
     struct usbkeyboard* kbd = input_get_drvdata(dev);
@@ -138,7 +225,19 @@ static int usbkeyboard_alloc_memory(struct usb_device* dev, struct usbkeyboard* 
         return -1;
     }
 
+    if(!(kbd->led = usb_alloc_urb(0, GFP_KERNEL))){
+        return -1;
+    }
+
     if(!(kbd->presses = usb_alloc_coherent(dev, 8, GFP_KERNEL, &kbd->presses_dma))){
+        return -1;
+    }
+
+    if(!(kbd->creq = kmalloc(sizeof(struct usb_ctrlrequest), GFP_KERNEL))){
+        return -1;
+    }
+
+    if(!(kbd->leds = usb_alloc_coherent(dev, 1, GFP_KERNEL, &kbd->leds_dma))){
         return -1;
     }
 
@@ -148,7 +247,10 @@ static int usbkeyboard_alloc_memory(struct usb_device* dev, struct usbkeyboard* 
 static void usbkeyboard_free_memory(struct usb_device* dev, struct usbkeyboard* kbd)
 {
     usb_free_urb(kbd->irq);
+    usb_free_urb(kbd->led);
     usb_free_coherent(dev, 8, kbd->presses, kbd->presses_dma);
+    kfree(kbd->creq);
+    usb_free_coherent(dev, 1, kbd->leds, kbd->leds_dma);
 }
 
 static int usbkeyboard_probe(struct usb_interface* intf, const struct usb_device_id* id)
@@ -192,6 +294,8 @@ static int usbkeyboard_probe(struct usb_interface* intf, const struct usb_device
 
     kbd->usbdev = dev;
     kbd->dev = input_dev;
+
+    spin_lock_init(&kbd->leds_lock);
     
     if(dev->manufacturer){
         strscpy(kbd->name, dev->manufacturer, sizeof(kbd->name));
@@ -222,7 +326,10 @@ static int usbkeyboard_probe(struct usb_interface* intf, const struct usb_device
 
     input_set_drvdata(input_dev, kbd);
 
-    input_dev->evbit[0] = BIT_MASK(EV_KEY) | BIT_MASK(EV_REP);
+    input_dev->evbit[0] = BIT_MASK(EV_KEY) | BIT_MASK(EV_REP) | BIT_MASK(EV_LED);
+
+    input_dev->ledbit[0] = BIT_MASK(LED_NUML) | BIT_MASK(LED_CAPSL) | 
+                           BIT_MASK(LED_SCROLLL) | BIT_MASK(LED_COMPOSE) | BIT_MASK(LED_KANA);
     
     for(i = 0; i < 255; i++){
         set_bit(usbkeyboard_keycode[i], input_dev->keybit);
@@ -230,6 +337,7 @@ static int usbkeyboard_probe(struct usb_interface* intf, const struct usb_device
 
     clear_bit(0, input_dev->keybit);
 
+    input_dev->event = usbkeyboard_event;
     input_dev->open = usbkeyboard_open;
     input_dev->close = usbkeyboard_close;
 
@@ -240,6 +348,22 @@ static int usbkeyboard_probe(struct usb_interface* intf, const struct usb_device
     
     kbd->irq->transfer_dma = kbd->presses_dma;
     kbd->irq->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
+
+    kbd->creq->bRequestType = USB_TYPE_CLASS | USB_RECIP_INTERFACE;
+    kbd->creq->bRequest = 0x09;
+    kbd->creq->wValue = cpu_to_le16(0x0200);
+    kbd->creq->wIndex = cpu_to_le16(interface->desc.bInterfaceNumber);
+    kbd->creq->wLength = 1;
+
+    pipe = usb_sndctrlpipe(dev, 0);
+
+    usb_fill_control_urb(kbd->led, 
+                         dev, pipe, (void*) kbd->creq, kbd->leds,
+                         1,
+                         usbkeyboard_led, kbd);
+
+    kbd->led->transfer_dma = kbd->leds_dma;
+    kbd->led->transfer_dma |= URB_NO_TRANSFER_DMA_MAP;
 
     error = input_register_device(kbd->dev);
 
@@ -268,6 +392,7 @@ static void usbkeyboard_disconnect(struct usb_interface *intf)
     if(kbd){
         usb_kill_urb(kbd->irq);
         input_unregister_device(kbd->dev);
+        usb_kill_urb(kbd->led);
         usbkeyboard_free_memory(interface_to_usbdev(intf), kbd);
         kfree(kbd);
     }
